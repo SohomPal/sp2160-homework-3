@@ -1,0 +1,247 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <time.h>
+#include <sys/select.h>
+#include "logger.h"
+
+// Default values
+#define DEFAULT_MULTICAST_IP "239.0.0.1"
+#define DEFAULT_PORT 12345
+#define MAX_USER_ID_LEN 32
+
+// Global variables
+char user_id[MAX_USER_ID_LEN];
+char multicast_ip[16];  // IPv4 address string
+int port;
+int is_controller;
+int heartbeat_interval;
+int sockfd;
+
+void print_usage(const char *program_name) {
+    printf("Usage: %s <user_id> [options]\n", program_name);
+    printf("Options:\n");
+    printf("  -m <multicast_ip> or --multicast-ip=<multicast_ip>: Override default multicast IP (239.0.0.1)\n");
+    printf("  -p <port> or --port=<port>: Override default port (12345)\n");
+    printf("  -c <initial_interval>: Start as controller with specified heartbeat interval (0-30)\n");
+    exit(EXIT_FAILURE);
+}
+
+int parse_arguments(int argc, char *argv[]) {
+    if (argc < 2) {
+        print_usage(argv[0]);
+    }
+
+    // Set default values
+    strncpy(multicast_ip, DEFAULT_MULTICAST_IP, sizeof(multicast_ip) - 1);
+    port = DEFAULT_PORT;
+    is_controller = 0;
+    heartbeat_interval = 0;
+
+    // Copy user_id
+    if (strlen(argv[1]) >= MAX_USER_ID_LEN) {
+        fprintf(stderr, "Error: user_id must be less than %d characters\n", MAX_USER_ID_LEN);
+        return -1;
+    }
+    strncpy(user_id, argv[1], MAX_USER_ID_LEN - 1);
+    user_id[MAX_USER_ID_LEN - 1] = '\0';
+
+    // Parse options
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0 || strncmp(argv[i], "--multicast-ip=", 15) == 0) {
+            const char *ip;
+            if (strcmp(argv[i], "-m") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "Error: Missing multicast IP address\n");
+                    return -1;
+                }
+                ip = argv[++i];
+            } else {
+                ip = argv[i] + 15;
+            }
+            strncpy(multicast_ip, ip, sizeof(multicast_ip) - 1);
+        }
+        else if (strcmp(argv[i], "-p") == 0 || strncmp(argv[i], "--port=", 7) == 0) {
+            const char *port_str;
+            if (strcmp(argv[i], "-p") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "Error: Missing port number\n");
+                    return -1;
+                }
+                port_str = argv[++i];
+            } else {
+                port_str = argv[i] + 7;
+            }
+            port = atoi(port_str);
+            if (port <= 0 || port > 65535) {
+                fprintf(stderr, "Error: Invalid port number\n");
+                return -1;
+            }
+        }
+        else if (strcmp(argv[i], "-c") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: Missing heartbeat interval\n");
+                return -1;
+            }
+            heartbeat_interval = atoi(argv[++i]);
+            if (heartbeat_interval < 0 || heartbeat_interval > 30) {
+                fprintf(stderr, "Error: Heartbeat interval must be between 0 and 30\n");
+                return -1;
+            }
+            is_controller = 1;
+        }
+        else {
+            fprintf(stderr, "Error: Unknown option %s\n", argv[i]);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// Function to set up multicast socket
+int setup_multicast_socket() {
+    struct sockaddr_in addr;
+    struct ip_mreq mreq;
+    
+    // Create UDP socket
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("socket creation failed");
+        return -1;
+    }
+
+    // Allow multiple sockets to use the same port
+    int reuse = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        perror("setsockopt SO_REUSEADDR failed");
+        return -1;
+    }
+
+    // Allow multiple processes to bind to the same port
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+        perror("setsockopt SO_REUSEPORT failed");
+        return -1;
+    }
+
+    // Set up multicast
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    // Bind to the port
+    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        return -1;
+    }
+
+    // Join multicast group
+    mreq.imr_multiaddr.s_addr = inet_addr(multicast_ip);
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        perror("setsockopt IP_ADD_MEMBERSHIP failed");
+        return -1;
+    }
+
+    // Set multicast TTL
+    int ttl = 1;
+    if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
+        perror("setsockopt IP_MULTICAST_TTL failed");
+        return -1;
+    }
+
+    // Set multicast interface
+    struct in_addr local_interface;
+    local_interface.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_IF, &local_interface, sizeof(local_interface)) < 0) {
+        perror("setsockopt IP_MULTICAST_IF failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+// send heartbeat message if controller function
+void send_heartbeat(int sockfd) {
+    char message[1024];
+    snprintf(message, sizeof(message), "Heartbeat from %s", user_id);
+
+    // send message to multicast group
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr.s_addr = inet_addr(multicast_ip);
+    dest_addr.sin_port = htons(port);
+
+    // send message
+    if (sendto(sockfd, message, strlen(message), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        perror("sendto");
+    }
+
+    // log message
+    log_message(stdout, user_id, "Sent heartbeat message");
+}
+
+// receive heartbeat messages
+void receive_heartbeats(int sockfd) {
+    char buffer[1024];
+    struct sockaddr_in sender_addr;
+    socklen_t sender_len = sizeof(sender_addr);
+
+    // receive message
+    ssize_t num_bytes = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&sender_addr, &sender_len);
+    if (num_bytes < 0) {
+        perror("recvfrom");
+        return;
+    }
+
+    // log message
+    log_message(stdout, user_id, "Received heartbeat message");
+
+    // print message
+    printf("Received heartbeat from %s\n", inet_ntoa(sender_addr.sin_addr));
+
+    // log message
+    log_message(stdout, user_id, "Received heartbeat from %s", inet_ntoa(sender_addr.sin_addr));
+}
+
+int main(int argc, char *argv[]) {
+    if (parse_arguments(argc, argv) != 0) {
+        return EXIT_FAILURE;
+    }
+
+    // Print configuration
+    printf("Configuration:\n");
+    printf("User ID: %s\n", user_id);
+    printf("Multicast IP: %s\n", multicast_ip);
+    printf("Port: %d\n", port);
+    printf("Mode: %s\n", is_controller ? "Controller" : "Client");
+    if (is_controller) {
+        printf("Initial Heartbeat Interval: %d\n", heartbeat_interval);
+    }
+
+    // Set up multicast socket
+    if (setup_multicast_socket() < 0) {
+        fprintf(stderr, "Failed to set up multicast socket\n");
+        return EXIT_FAILURE;
+    }
+
+    // main loop
+    while (1) {
+        if (is_controller) {
+            send_heartbeat(sockfd);
+            sleep(heartbeat_interval);
+        }
+        else {
+            receive_heartbeats(sockfd);
+        }
+    }
+
+    // close socket
+    close(sockfd);
+    return EXIT_SUCCESS;
+}
