@@ -297,6 +297,117 @@ void handle_controller_input(FILE *log_file) {
     }
 }
 
+// Function to handle controller takeover prompt
+int handle_controller_takeover(FILE *log_file) {
+    printf("\nController is down. Would you like to become the new controller?\n");
+    printf("Enter a heartbeat interval (0-30) to become controller, or any other input to remain a client: ");
+    
+    char input[MAX_MSG_LEN];
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        input[strcspn(input, "\n")] = 0;  // Remove newline
+        
+        int new_interval;
+        if (sscanf(input, "%d", &new_interval) == 1) {
+            if (new_interval >= 0 && new_interval <= 30) {
+                // Check if another controller has taken over
+                fd_set read_fds;
+                struct timeval tv;
+                
+                FD_ZERO(&read_fds);
+                FD_SET(sockfd, &read_fds);
+                
+                // Set timeout to 2 seconds to check for other controllers
+                tv.tv_sec = 2;
+                tv.tv_usec = 0;
+                
+                if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) > 0) {
+                    char buffer[MAX_MSG_LEN];
+                    struct sockaddr_in sender_addr;
+                    socklen_t sender_len = sizeof(sender_addr);
+                    
+                    if (recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0,
+                                (struct sockaddr *)&sender_addr, &sender_len) > 0) {
+                        buffer[strcpl(buffer, "\n")] = 0;
+                        
+                        // If we receive any message, assume another controller exists
+                        printf("Another client has already become the controller. Remaining as client.\n");
+                        log_message(log_file, user_id, "Another controller detected, remaining as client");
+                        return 0;
+                    }
+                }
+                
+                // No other controller detected, become the new controller
+                is_controller = 1;
+                heartbeat_interval = new_interval;
+                log_message(log_file, user_id, "Becoming new controller with interval %d", new_interval);
+                send_interval_command(new_interval, log_file);
+                return 1;
+            }
+        }
+        printf("Invalid input. Remaining as client.\n");
+        log_message(log_file, user_id, "User declined controller role");
+    }
+    return 0;
+}
+
+// Function to process received message
+void process_message(const char *message, const char *sender_id, FILE *log_file) {
+    // Ignore messages from self
+    if (strcmp(sender_id, user_id) == 0) {
+        return;
+    }
+
+    // Log received message (for clients)
+    if (!is_controller) {
+        log_message(log_file, user_id, "Client received from %s: %s", sender_id, message);
+    }
+
+    // Process different message types
+    if (strncmp(message, "HEARTBEAT", 9) == 0) {
+        // Handle heartbeat message
+        if (!is_controller) {
+            log_message(log_file, user_id, "Client processing heartbeat from %s", sender_id);
+        }
+    }
+    else if (strncmp(message, "START", 5) == 0) {
+        // Handle start command
+        if (!is_controller) {
+            log_message(log_file, user_id, "Client received START command from %s", sender_id);
+        }
+    }
+    else if (strncmp(message, "STOP", 4) == 0) {
+        // Handle stop command
+        if (!is_controller) {
+            log_message(log_file, user_id, "Client received STOP command from %s", sender_id);
+        }
+    }
+    else if (strncmp(message, "INTERVAL", 8) == 0) {
+        // Handle interval command
+        int new_interval;
+        if (sscanf(message, "INTERVAL %d", &new_interval) == 1) {
+            if (is_controller) {
+                log_message(log_file, user_id, "Controller setting new heartbeat interval to %d", new_interval);
+                heartbeat_interval = new_interval;
+            } else {
+                log_message(log_file, user_id, "Client received new interval %d from %s", new_interval, sender_id);
+            }
+        }
+    }
+    else if (strncmp(message, "BYE", 3) == 0) {
+        // Handle BYE message
+        if (!is_controller) {
+            log_message(log_file, user_id, "Client received BYE from %s", sender_id);
+            handle_controller_takeover(log_file);
+        }
+    }
+    else if (strncmp(message, "CONTROLLER_DOWN", 14) == 0) {
+        // Handle CONTROLLER_DOWN message
+        if (!is_controller) {
+            log_message(log_file, user_id, "Controller is down");
+            handle_controller_takeover(log_file);
+        }
+    }
+}
 
 int main(int argc, char *argv[]) {
     if (parse_arguments(argc, argv) != 0) {
