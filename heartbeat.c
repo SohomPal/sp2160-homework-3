@@ -13,6 +13,8 @@
 #define DEFAULT_MULTICAST_IP "239.0.0.1"
 #define DEFAULT_PORT 12345
 #define MAX_USER_ID_LEN 32
+#define COMMAND_INTERVAL 5  // Interval for re-sending SET_INTERVAL command
+#define MAX_MSG_LEN 1024
 
 // Global variables
 char user_id[MAX_USER_ID_LEN];
@@ -21,6 +23,7 @@ int port;
 int is_controller;
 int heartbeat_interval;
 int sockfd;
+time_t last_interval_command_time;
 
 void print_usage(const char *program_name) {
     printf("Usage: %s <user_id> [options]\n", program_name);
@@ -206,6 +209,95 @@ void receive_heartbeats(int sockfd, FILE *log_file) {
     log_message(log_file, user_id, "Received heartbeat from %s", inet_ntoa(sender_addr.sin_addr));
 }
 
+// Function to send multicast message
+void send_multicast_message(const char *message) {
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr.s_addr = inet_addr(multicast_ip);
+    dest_addr.sin_port = htons(port);
+
+    if (sendto(sockfd, message, strlen(message), 0, 
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        perror("sendto");
+    }
+}
+
+// Function to send SET_INTERVAL command
+void send_interval_command(int interval, FILE *log_file) {
+    char message[MAX_MSG_LEN];
+    snprintf(message, sizeof(message), "SET_INTERVAL %d", interval);
+    
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr.s_addr = inet_addr(multicast_ip);
+    dest_addr.sin_port = htons(port);
+
+    if (sendto(sockfd, message, strlen(message), 0, 
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        perror("sendto");
+        return;
+    }
+
+    log_message(log_file, user_id, "Sent SET_INTERVAL command with value %d", interval);
+    last_interval_command_time = time(NULL);
+}
+
+// Function to send CONTROLLER_DOWN command
+void send_controller_down(FILE *log_file) {
+    char message[] = "CONTROLLER_DOWN";
+    
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr.s_addr = inet_addr(multicast_ip);
+    dest_addr.sin_port = htons(port);
+
+    if (sendto(sockfd, message, strlen(message), 0, 
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        perror("sendto");
+        return;
+    }
+
+    log_message(log_file, user_id, "Sent CONTROLLER_DOWN command");
+}
+
+// Function to handle controller input
+void handle_controller_input(FILE *log_file) {
+    char input[MAX_MSG_LEN];
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        input[strcspn(input, "\n")] = 0;  // Remove newline
+
+        if (strcmp(input, "exit") == 0) {
+            log_message(log_file, user_id, "Relinquishing controller role");
+            send_controller_down(log_file);
+            send_multicast_message("BYE");
+            fclose(log_file);
+            close(sockfd);
+            exit(EXIT_SUCCESS);
+        }
+        else if (strcmp(input, "abort") == 0) {
+            fclose(log_file);
+            abort();
+        }
+        else {
+            // Try to parse as interval
+            int new_interval;
+            if (sscanf(input, "%d", &new_interval) == 1) {
+                if (new_interval >= 0 && new_interval <= 30) {
+                    log_message(log_file, user_id, "User set interval to %d", new_interval);
+                    heartbeat_interval = new_interval;
+                    send_interval_command(new_interval, log_file);
+                } else {
+                    fprintf(stderr, "Error: Interval must be between 0 and 30\n");
+                }
+            }
+        }
+    }
+}
+
+
 int main(int argc, char *argv[]) {
     if (parse_arguments(argc, argv) != 0) {
         return EXIT_FAILURE;
@@ -237,19 +329,54 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Initialize last interval command time
+    last_interval_command_time = time(NULL);
+
     // main loop
     while (1) {
         if (is_controller) {
-            // allow user input
+            fd_set read_fds;
+            struct timeval tv;
+            
+            FD_ZERO(&read_fds);
+            FD_SET(sockfd, &read_fds);
+            FD_SET(STDIN_FILENO, &read_fds);
+
+            // Set timeout for select
+            tv.tv_sec = 1;  // Check every second
+            tv.tv_usec = 0;
+
+            if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) < 0) {
+                perror("select failed");
+                break;
+            }
+
+            // Handle socket input
+            if (FD_ISSET(sockfd, &read_fds)) {
+                receive_heartbeats(sockfd, log_file);
+            }
+
+            // Handle user input
+            if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+                handle_controller_input(log_file);
+            }
+
+            // Check if we need to resend the interval command
+            time_t current_time = time(NULL);
+            if (current_time - last_interval_command_time >= COMMAND_INTERVAL) {
+                send_interval_command(heartbeat_interval, log_file);
+            }
+
+            // Send heartbeat
             send_heartbeat(sockfd, log_file);
             sleep(heartbeat_interval);
-        }
-        else {
+        } else {
             receive_heartbeats(sockfd, log_file);
         }
     }
 
     // close socket
     close(sockfd);
+    fclose(log_file);
     return EXIT_SUCCESS;
 }
