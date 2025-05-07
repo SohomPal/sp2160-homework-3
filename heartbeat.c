@@ -166,7 +166,7 @@ int setup_multicast_socket() {
 }
 
 // send heartbeat message if controller function
-void send_heartbeat(int sockfd) {
+void send_heartbeat(int sockfd, FILE *log_file) {
     char message[1024];
     snprintf(message, sizeof(message), "Heartbeat from %s", user_id);
 
@@ -183,11 +183,11 @@ void send_heartbeat(int sockfd) {
     }
 
     // log message
-    log_message(stdout, user_id, "Sent heartbeat message");
+    log_message(log_file, user_id, "Sent heartbeat message");
 }
 
 // receive heartbeat messages
-void receive_heartbeats(int sockfd) {
+void receive_heartbeats(int sockfd, FILE *log_file) {
     char buffer[1024];
     struct sockaddr_in sender_addr;
     socklen_t sender_len = sizeof(sender_addr);
@@ -199,14 +199,11 @@ void receive_heartbeats(int sockfd) {
         return;
     }
 
-    // log message
-    log_message(stdout, user_id, "Received heartbeat message");
-
     // print message
     printf("Received heartbeat from %s\n", inet_ntoa(sender_addr.sin_addr));
 
     // log message
-    log_message(stdout, user_id, "Received heartbeat from %s", inet_ntoa(sender_addr.sin_addr));
+    log_message(log_file, user_id, "Received heartbeat from %s", inet_ntoa(sender_addr.sin_addr));
 }
 
 int main(int argc, char *argv[]) {
@@ -230,14 +227,25 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    // create log file in append mode
+    char log_filename[64] = "heartbeat_app_";
+    strcat(log_filename, user_id);
+    strcat(log_filename, ".log");
+    FILE *log_file = fopen(log_filename, "a");
+    if (log_file == NULL) {
+        perror("Failed to open log file");
+        return EXIT_FAILURE;
+    }
+
     // main loop
     while (1) {
         if (is_controller) {
-            send_heartbeat(sockfd);
+            // allow user input
+            send_heartbeat(sockfd, log_file);
             sleep(heartbeat_interval);
         }
         else {
-            receive_heartbeats(sockfd);
+            receive_heartbeats(sockfd, log_file);
         }
     }
 
