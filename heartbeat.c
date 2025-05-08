@@ -8,6 +8,7 @@
 #include <time.h>
 #include <sys/select.h>
 #include "logger.h"
+#include <signal.h>
 
 // Default values
 #define DEFAULT_MULTICAST_IP "239.0.0.1"
@@ -15,6 +16,7 @@
 #define MAX_USER_ID_LEN 32
 #define COMMAND_INTERVAL 5  // Interval for re-sending SET_INTERVAL command
 #define MAX_MSG_LEN 1024
+#define MISSED_HEARTBEAT_THRESHOLD 2  // Number of missed heartbeats before considering controller down
 
 // Global variables
 char user_id[MAX_USER_ID_LEN];
@@ -24,6 +26,9 @@ int is_controller;
 int heartbeat_interval;
 int sockfd;
 time_t last_interval_command_time;
+time_t last_controller_heartbeat;
+int missed_heartbeats;
+char current_controller_id[MAX_USER_ID_LEN];
 
 void print_usage(const char *program_name) {
     printf("Usage: %s <user_id> [options]\n", program_name);
@@ -168,10 +173,10 @@ int setup_multicast_socket() {
     return 0;
 }
 
-// send heartbeat message if controller function
-void send_heartbeat(int sockfd, FILE *log_file) {
-    char message[1024];
-    snprintf(message, sizeof(message), "Heartbeat from %s", user_id);
+// Function to send heartbeat message (for clients)
+void send_heartbeat(FILE *log_file) {
+    char message[MAX_MSG_LEN];
+    snprintf(message, sizeof(message), "HEARTBEAT from %s", user_id);
 
     // send message to multicast group
     struct sockaddr_in dest_addr;
@@ -181,46 +186,13 @@ void send_heartbeat(int sockfd, FILE *log_file) {
     dest_addr.sin_port = htons(port);
 
     // send message
-    if (sendto(sockfd, message, strlen(message), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-        perror("sendto");
-    }
-
-    // log message
-    log_message(log_file, user_id, "Sent heartbeat message");
-}
-
-// receive heartbeat messages
-void receive_heartbeats(int sockfd, FILE *log_file) {
-    char buffer[1024];
-    struct sockaddr_in sender_addr;
-    socklen_t sender_len = sizeof(sender_addr);
-
-    // receive message
-    ssize_t num_bytes = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&sender_addr, &sender_len);
-    if (num_bytes < 0) {
-        perror("recvfrom");
-        return;
-    }
-
-    // print message
-    printf("Received heartbeat from %s\n", inet_ntoa(sender_addr.sin_addr));
-
-    // log message
-    log_message(log_file, user_id, "Received heartbeat from %s", inet_ntoa(sender_addr.sin_addr));
-}
-
-// Function to send multicast message
-void send_multicast_message(const char *message) {
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_addr.s_addr = inet_addr(multicast_ip);
-    dest_addr.sin_port = htons(port);
-
     if (sendto(sockfd, message, strlen(message), 0, 
                (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
         perror("sendto");
+        return;
     }
+
+    log_message(log_file, user_id, "Sent heartbeat message");
 }
 
 // Function to send SET_INTERVAL command
@@ -244,6 +216,159 @@ void send_interval_command(int interval, FILE *log_file) {
     last_interval_command_time = time(NULL);
 }
 
+int handle_controller_takeover(FILE *log_file) {
+    printf("\nController is down. Would you like to become the new controller?\n");
+    printf("Enter a number between 0-30 to accept, any other input to decline: ");
+    
+    char input[MAX_MSG_LEN];
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        input[strcspn(input, "\n")] = 0;  // Remove newline
+        
+        int new_interval;
+        if (sscanf(input, "%d", &new_interval) == 1) {
+            if (new_interval >= 0 && new_interval <= 30) {
+                // Set a short timeout to check for other controllers
+                fd_set read_fds;
+                struct timeval tv;
+                tv.tv_sec = 2;  // 2 second timeout
+                tv.tv_usec = 0;
+                
+                FD_ZERO(&read_fds);
+                FD_SET(sockfd, &read_fds);
+                
+                // Check for any controller messages
+                if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) > 0) {
+                    char buffer[MAX_MSG_LEN];
+                    struct sockaddr_in sender_addr;
+                    socklen_t sender_len = sizeof(sender_addr);
+                    
+                    if (recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0,
+                                (struct sockaddr *)&sender_addr, &sender_len) > 0) {
+                        buffer[strcspn(buffer, "\n")] = 0;
+                        
+                        // If we receive any controller message, another client has taken over
+                        if (strncmp(buffer, "SET_INTERVAL", 11) == 0 || 
+                            strncmp(buffer, "HEARTBEAT", 9) == 0) {
+                            printf("Another client has already become the controller.\n");
+                            log_message(log_file, user_id, "Another client became controller, remaining as client");
+                            return 0;
+                        }
+                    }
+                }
+                
+                // No other controller found, become the new controller
+                is_controller = 1;
+                heartbeat_interval = new_interval;
+                log_message(log_file, user_id, "Assuming controller role with interval %d", new_interval);
+                send_interval_command(new_interval, log_file);
+                return 1;
+            }
+        }
+        printf("Invalid input. Remaining as client.\n");
+        log_message(log_file, user_id, "Declined controller role");
+    }
+    return 0;
+}
+
+// Function to receive and process messages
+void receive_messages(int sockfd, FILE *log_file) {
+    char buffer[MAX_MSG_LEN];
+    struct sockaddr_in sender_addr;
+    socklen_t sender_len = sizeof(sender_addr);
+
+    // receive message
+    ssize_t num_bytes = recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0, 
+                                (struct sockaddr *)&sender_addr, &sender_len);
+    if (num_bytes < 0) {
+        perror("recvfrom");
+        return;
+    }
+
+    buffer[num_bytes] = '\0';  // Null terminate the received message
+    char *sender_ip = inet_ntoa(sender_addr.sin_addr);
+    int sender_port = ntohs(sender_addr.sin_port);
+
+    // Extract sender ID from message if possible
+    char message_sender[MAX_USER_ID_LEN] = {0};
+    if (strncmp(buffer, "HEARTBEAT from", 13) == 0) {
+        sscanf(buffer, "HEARTBEAT from %s", message_sender);
+    } else if (strncmp(buffer, "BYE", 3) == 0) {
+        sscanf(buffer, "BYE from %s", message_sender);
+    }
+
+    // Ignore messages from self (either by IP or by user ID in message)
+    if (strcmp(sender_ip, user_id) == 0 || 
+        (strlen(message_sender) > 0 && strcmp(message_sender, user_id) == 0)) {
+        return;
+    }
+
+    // Process message based on role
+    if (is_controller) {
+        // Controller processes client heartbeats
+        if (strncmp(buffer, "HEARTBEAT from", 13) == 0) {
+            char client_id[MAX_USER_ID_LEN];
+            if (sscanf(buffer, "HEARTBEAT from %s", client_id) == 1) {
+                log_message(log_file, user_id, "Received heartbeat from client %s (IP: %s, Port: %d)", 
+                           client_id, sender_ip, sender_port);
+            }
+        } else if (strncmp(buffer, "SET_INTERVAL", 11) == 0) {
+            // Ignore SET_INTERVAL messages as controller - they must be from ourselves
+            return;
+        } else {
+            // Log uninterpretable message
+            log_message(log_file, user_id, "Received uninterpretable message from %s:%d: %s", 
+                       sender_ip, sender_port, buffer);
+        }
+    } else {
+        // Client processes controller commands
+        if (strncmp(buffer, "SET_INTERVAL", 11) == 0) {
+            int new_interval;
+            if (sscanf(buffer, "SET_INTERVAL %d", &new_interval) == 1) {
+                log_message(log_file, user_id, "Received SET_INTERVAL command from controller (IP: %s, Port: %d) with value %d", 
+                           sender_ip, sender_port, new_interval);
+                heartbeat_interval = new_interval;
+            }
+        }
+        else if (strncmp(buffer, "BYE", 3) == 0) {
+            log_message(log_file, user_id, "Received BYE message from controller (IP: %s, Port: %d)", 
+                       sender_ip, sender_port);
+            handle_controller_takeover(log_file);
+        }
+        else if (strncmp(buffer, "CONTROLLER_DOWN", 14) == 0) {
+            log_message(log_file, user_id, "Received CONTROLLER_DOWN command from controller (IP: %s, Port: %d)", 
+                       sender_ip, sender_port);
+            handle_controller_takeover(log_file);
+        }
+        else if (strncmp(buffer, "HEARTBEAT from", 13) == 0) {
+            char client_id[MAX_USER_ID_LEN];
+            if (sscanf(buffer, "HEARTBEAT from %s", client_id) == 1) {
+                log_message(log_file, user_id, "Received heartbeat from client %s (IP: %s, Port: %d)", 
+                           client_id, sender_ip, sender_port);
+            }
+        }
+        else {
+            // Log uninterpretable message
+            log_message(log_file, user_id, "Received uninterpretable message from %s:%d: %s", 
+                       sender_ip, sender_port, buffer);
+        }
+    }
+}
+
+// Function to send multicast message
+void send_multicast_message(const char *message) {
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr.s_addr = inet_addr(multicast_ip);
+    dest_addr.sin_port = htons(port);
+
+    if (sendto(sockfd, message, strlen(message), 0, 
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        perror("sendto");
+    }
+}
+
+
 // Function to send CONTROLLER_DOWN command
 void send_controller_down(FILE *log_file) {
     char message[] = "CONTROLLER_DOWN";
@@ -263,6 +388,30 @@ void send_controller_down(FILE *log_file) {
     log_message(log_file, user_id, "Sent CONTROLLER_DOWN command");
 }
 
+// Function to handle controller shutdown
+void handle_controller_shutdown(FILE *log_file, int is_abort) {
+    if (is_controller) {
+        if (is_abort) {
+            // For abort, try to send CONTROLLER_DOWN quickly
+            send_controller_down(log_file);
+            log_message(log_file, user_id, "Controller aborting");
+        } else {
+            // For normal exit, send BYE and CONTROLLER_DOWN
+            log_message(log_file, user_id, "Controller shutting down");
+            send_controller_down(log_file);
+            send_multicast_message("BYE");
+        }
+    }
+    
+    // Close resources
+    if (log_file != NULL) {
+        fclose(log_file);
+    }
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+}
+
 // Function to handle controller input
 void handle_controller_input(FILE *log_file) {
     char input[MAX_MSG_LEN];
@@ -270,15 +419,13 @@ void handle_controller_input(FILE *log_file) {
         input[strcspn(input, "\n")] = 0;  // Remove newline
 
         if (strcmp(input, "exit") == 0) {
-            log_message(log_file, user_id, "Relinquishing controller role");
-            send_controller_down(log_file);
-            send_multicast_message("BYE");
-            fclose(log_file);
-            close(sockfd);
+            log_message(log_file, user_id, "User entered exit command");
+            handle_controller_shutdown(log_file, 0);
             exit(EXIT_SUCCESS);
         }
         else if (strcmp(input, "abort") == 0) {
-            fclose(log_file);
+            log_message(log_file, user_id, "User entered abort command");
+            handle_controller_shutdown(log_file, 1);
             abort();
         }
         else {
@@ -297,122 +444,72 @@ void handle_controller_input(FILE *log_file) {
     }
 }
 
-// Function to handle controller takeover prompt
-int handle_controller_takeover(FILE *log_file) {
-    printf("\nController is down. Would you like to become the new controller?\n");
-    printf("Enter a heartbeat interval (0-30) to become controller, or any other input to remain a client: ");
-    
-    char input[MAX_MSG_LEN];
-    if (fgets(input, sizeof(input), stdin) != NULL) {
-        input[strcspn(input, "\n")] = 0;  // Remove newline
-        
-        int new_interval;
-        if (sscanf(input, "%d", &new_interval) == 1) {
-            if (new_interval >= 0 && new_interval <= 30) {
-                // Check if another controller has taken over
-                fd_set read_fds;
-                struct timeval tv;
+// Function to check for controller failure
+void check_controller_status(FILE *log_file) {
+    if (!is_controller && strlen(current_controller_id) > 0) {
+        time_t current_time = time(NULL);
+        if (current_time - last_controller_heartbeat > heartbeat_interval * MISSED_HEARTBEAT_THRESHOLD) {
+            missed_heartbeats++;
+            printf("\nWarning: Missed %d heartbeats from controller %s\n", 
+                   missed_heartbeats, current_controller_id);
+            
+            if (missed_heartbeats >= MISSED_HEARTBEAT_THRESHOLD) {
+                printf("\nController %s appears to be down. Would you like to become the new controller?\n", 
+                       current_controller_id);
+                printf("Enter a number between 0-30 to accept, any other input to decline: ");
                 
-                FD_ZERO(&read_fds);
-                FD_SET(sockfd, &read_fds);
-                
-                // Set timeout to 2 seconds to check for other controllers
-                tv.tv_sec = 2;
-                tv.tv_usec = 0;
-                
-                if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) > 0) {
-                    char buffer[MAX_MSG_LEN];
-                    struct sockaddr_in sender_addr;
-                    socklen_t sender_len = sizeof(sender_addr);
+                char input[MAX_MSG_LEN];
+                if (fgets(input, sizeof(input), stdin) != NULL) {
+                    input[strcspn(input, "\n")] = 0;  // Remove newline
                     
-                    if (recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0,
-                                (struct sockaddr *)&sender_addr, &sender_len) > 0) {
-                        buffer[strcpl(buffer, "\n")] = 0;
-                        
-                        // If we receive any message, assume another controller exists
-                        printf("Another client has already become the controller. Remaining as client.\n");
-                        log_message(log_file, user_id, "Another controller detected, remaining as client");
-                        return 0;
+                    int new_interval;
+                    if (sscanf(input, "%d", &new_interval) == 1) {
+                        if (new_interval >= 0 && new_interval <= 30) {
+                            log_message(log_file, user_id, "Becoming new controller with interval %d", new_interval);
+                            is_controller = 1;
+                            heartbeat_interval = new_interval;
+                            memset(current_controller_id, 0, MAX_USER_ID_LEN);
+                            send_interval_command(new_interval, log_file);
+                        } else {
+                            printf("Invalid interval. Remaining as client.\n");
+                            log_message(log_file, user_id, "Declined controller role due to invalid interval");
+                        }
+                    } else {
+                        printf("Invalid input. Remaining as client.\n");
+                        log_message(log_file, user_id, "Declined controller role");
                     }
                 }
-                
-                // No other controller detected, become the new controller
-                is_controller = 1;
-                heartbeat_interval = new_interval;
-                log_message(log_file, user_id, "Becoming new controller with interval %d", new_interval);
-                send_interval_command(new_interval, log_file);
-                return 1;
+                missed_heartbeats = 0;  // Reset counter after prompt
             }
         }
-        printf("Invalid input. Remaining as client.\n");
-        log_message(log_file, user_id, "User declined controller role");
     }
-    return 0;
 }
 
-// Function to process received message
-void process_message(const char *message, const char *sender_id, FILE *log_file) {
-    // Ignore messages from self
-    if (strcmp(sender_id, user_id) == 0) {
-        return;
-    }
 
-    // Log received message (for clients)
-    if (!is_controller) {
-        log_message(log_file, user_id, "Client received from %s: %s", sender_id, message);
-    }
-
-    // Process different message types
-    if (strncmp(message, "HEARTBEAT", 9) == 0) {
-        // Handle heartbeat message
-        if (!is_controller) {
-            log_message(log_file, user_id, "Client processing heartbeat from %s", sender_id);
+// Add signal handler for clean shutdown
+void signal_handler(int signum) {
+    if (is_controller) {
+        FILE *log_file = fopen("heartbeat_app_controller.log", "a");
+        if (log_file != NULL) {
+            handle_controller_shutdown(log_file, 0);
         }
     }
-    else if (strncmp(message, "START", 5) == 0) {
-        // Handle start command
-        if (!is_controller) {
-            log_message(log_file, user_id, "Client received START command from %s", sender_id);
-        }
-    }
-    else if (strncmp(message, "STOP", 4) == 0) {
-        // Handle stop command
-        if (!is_controller) {
-            log_message(log_file, user_id, "Client received STOP command from %s", sender_id);
-        }
-    }
-    else if (strncmp(message, "INTERVAL", 8) == 0) {
-        // Handle interval command
-        int new_interval;
-        if (sscanf(message, "INTERVAL %d", &new_interval) == 1) {
-            if (is_controller) {
-                log_message(log_file, user_id, "Controller setting new heartbeat interval to %d", new_interval);
-                heartbeat_interval = new_interval;
-            } else {
-                log_message(log_file, user_id, "Client received new interval %d from %s", new_interval, sender_id);
-            }
-        }
-    }
-    else if (strncmp(message, "BYE", 3) == 0) {
-        // Handle BYE message
-        if (!is_controller) {
-            log_message(log_file, user_id, "Client received BYE from %s", sender_id);
-            handle_controller_takeover(log_file);
-        }
-    }
-    else if (strncmp(message, "CONTROLLER_DOWN", 14) == 0) {
-        // Handle CONTROLLER_DOWN message
-        if (!is_controller) {
-            log_message(log_file, user_id, "Controller is down");
-            handle_controller_takeover(log_file);
-        }
-    }
+    exit(signum);
 }
 
 int main(int argc, char *argv[]) {
+    // Set up signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     if (parse_arguments(argc, argv) != 0) {
         return EXIT_FAILURE;
     }
+
+    // Initialize controller tracking variables
+    memset(current_controller_id, 0, MAX_USER_ID_LEN);
+    last_controller_heartbeat = 0;
+    missed_heartbeats = 0;
 
     // Print configuration
     printf("Configuration:\n");
@@ -446,6 +543,7 @@ int main(int argc, char *argv[]) {
     // main loop
     while (1) {
         if (is_controller) {
+            // Controller mode
             fd_set read_fds;
             struct timeval tv;
             
@@ -459,12 +557,13 @@ int main(int argc, char *argv[]) {
 
             if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) < 0) {
                 perror("select failed");
+                handle_controller_shutdown(log_file, 0);
                 break;
             }
 
             // Handle socket input
             if (FD_ISSET(sockfd, &read_fds)) {
-                receive_heartbeats(sockfd, log_file);
+                receive_messages(sockfd, log_file);
             }
 
             // Handle user input
@@ -477,17 +576,35 @@ int main(int argc, char *argv[]) {
             if (current_time - last_interval_command_time >= COMMAND_INTERVAL) {
                 send_interval_command(heartbeat_interval, log_file);
             }
-
-            // Send heartbeat
-            send_heartbeat(sockfd, log_file);
-            sleep(heartbeat_interval);
         } else {
-            receive_heartbeats(sockfd, log_file);
+            // Client mode
+            // Send heartbeat with random delay
+            if (heartbeat_interval > 0) {
+                // Add random delay between 0 and 0.5 seconds
+                usleep((rand() % 500000) + 1);
+                send_heartbeat(log_file);
+                sleep(heartbeat_interval);
+            }
+            
+            // Check for messages
+            fd_set read_fds;
+            struct timeval tv;
+            
+            FD_ZERO(&read_fds);
+            FD_SET(sockfd, &read_fds);
+            
+            tv.tv_sec = 0;  // Don't block
+            tv.tv_usec = 100000;  // 100ms timeout
+            
+            if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) > 0) {
+                receive_messages(sockfd, log_file);
+            }
         }
     }
 
-    // close socket
-    close(sockfd);
-    fclose(log_file);
+    // Clean shutdown if we exit the main loop
+    if (is_controller) {
+        handle_controller_shutdown(log_file, 0);
+    }
     return EXIT_SUCCESS;
 }
