@@ -9,6 +9,10 @@
 #include <sys/select.h>
 #include "logger.h"
 #include <signal.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <pthread.h>
 
 // Default values
 #define DEFAULT_MULTICAST_IP "239.0.0.1"
@@ -17,6 +21,20 @@
 #define COMMAND_INTERVAL 5  // Interval for re-sending SET_INTERVAL command
 #define MAX_MSG_LEN 1024
 #define MISSED_HEARTBEAT_THRESHOLD 2  // Number of missed heartbeats before considering controller down
+
+// Shared memory and mutex for controller status
+#define SHM_NAME "/controller_status"
+#define MUTEX_NAME "/controller_mutex"
+
+typedef struct {
+    int controllerActive;
+    char controllerId[MAX_USER_ID_LEN];
+} ControllerStatus;
+
+ControllerStatus *controllerStatus = NULL;
+pthread_mutex_t *controllerMutex = NULL;
+int shmFd = -1;
+int mutexFd = -1;
 
 // Global variables
 char user_id[MAX_USER_ID_LEN];
@@ -216,7 +234,117 @@ void send_interval_command(int interval, FILE *log_file) {
     last_interval_command_time = time(NULL);
 }
 
+// Function to initialize shared memory and mutex
+int init_shared_memory() {
+    // Create or open shared memory for controller status
+    shmFd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shmFd == -1) {
+        perror("shm_open failed");
+        return -1;
+    }
+
+    // Get the current size of the shared memory
+    struct stat sb;
+    if (fstat(shmFd, &sb) == -1) {
+        perror("fstat failed");
+        close(shmFd);
+        shm_unlink(SHM_NAME);
+        return -1;
+    }
+
+    // Only set size if this is a new shared memory object
+    if (sb.st_size == 0) {
+        if (ftruncate(shmFd, sizeof(ControllerStatus)) == -1) {
+            perror("ftruncate failed");
+            close(shmFd);
+            shm_unlink(SHM_NAME);
+            return -1;
+        }
+    }
+
+    // Map shared memory
+    controllerStatus = (ControllerStatus *)mmap(NULL, sizeof(ControllerStatus),
+                                             PROT_READ | PROT_WRITE, MAP_SHARED,
+                                             shmFd, 0);
+    if (controllerStatus == MAP_FAILED) {
+        perror("mmap failed");
+        close(shmFd);
+        shm_unlink(SHM_NAME);
+        return -1;
+    }
+
+    // Create a process-shared mutex
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+
+    // Allocate mutex in shared memory
+    controllerMutex = (pthread_mutex_t *)mmap(NULL, sizeof(pthread_mutex_t),
+                                            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                                            -1, 0);
+    if (controllerMutex == MAP_FAILED) {
+        perror("mutex mmap failed");
+        pthread_mutexattr_destroy(&attr);
+        munmap(controllerStatus, sizeof(ControllerStatus));
+        close(shmFd);
+        shm_unlink(SHM_NAME);
+        return -1;
+    }
+
+    // Initialize the mutex
+    if (pthread_mutex_init(controllerMutex, &attr) != 0) {
+        perror("pthread_mutex_init failed");
+        pthread_mutexattr_destroy(&attr);
+        munmap(controllerMutex, sizeof(pthread_mutex_t));
+        munmap(controllerStatus, sizeof(ControllerStatus));
+        close(shmFd);
+        shm_unlink(SHM_NAME);
+        return -1;
+    }
+
+    pthread_mutexattr_destroy(&attr);
+
+    // Only initialize shared memory if this is the first process
+    if (sb.st_size == 0) {
+        controllerStatus->controllerActive = 0;
+        memset(controllerStatus->controllerId, 0, MAX_USER_ID_LEN);
+    }
+
+    return 0;
+}
+
+// Function to cleanup shared memory and mutex
+void cleanup_shared_memory() {
+    if (controllerMutex != NULL) {
+        pthread_mutex_destroy(controllerMutex);
+        munmap(controllerMutex, sizeof(pthread_mutex_t));
+    }
+    if (controllerStatus != NULL) {
+        munmap(controllerStatus, sizeof(ControllerStatus));
+    }
+    if (shmFd != -1) {
+        close(shmFd);
+        shm_unlink(SHM_NAME);
+    }
+}
+
+// Function to handle controller takeover
 int handle_controller_takeover(FILE *log_file) {
+    // Try to acquire mutex
+    if (pthread_mutex_lock(controllerMutex) != 0) {
+        perror("Failed to acquire mutex");
+        return 0;
+    }
+
+    // Check if controller is already active
+    if (controllerStatus->controllerActive) {
+        printf("Another client has already become the controller.\n");
+        log_message(log_file, user_id, "Another client became controller, remaining as client");
+        pthread_mutex_unlock(controllerMutex);
+        return 0;
+    }
+
+    // Prompt user
     printf("\nController is down. Would you like to become the new controller?\n");
     printf("Enter a number between 0-30 to accept, any other input to decline: ");
     
@@ -227,39 +355,28 @@ int handle_controller_takeover(FILE *log_file) {
         int new_interval;
         if (sscanf(input, "%d", &new_interval) == 1) {
             if (new_interval >= 0 && new_interval <= 30) {
-                // Set a short timeout to check for other controllers
-                fd_set read_fds;
-                struct timeval tv;
-                tv.tv_sec = 2;  // 2 second timeout
-                tv.tv_usec = 0;
-                
-                FD_ZERO(&read_fds);
-                FD_SET(sockfd, &read_fds);
-                
-                // Check for any controller messages
-                if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) > 0) {
-                    char buffer[MAX_MSG_LEN];
-                    struct sockaddr_in sender_addr;
-                    socklen_t sender_len = sizeof(sender_addr);
-                    
-                    if (recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0,
-                                (struct sockaddr *)&sender_addr, &sender_len) > 0) {
-                        buffer[strcspn(buffer, "\n")] = 0;
-                        
-                        // If we receive any controller message, another client has taken over
-                        if (strncmp(buffer, "SET_INTERVAL", 11) == 0 || 
-                            strncmp(buffer, "HEARTBEAT", 9) == 0) {
-                            printf("Another client has already become the controller.\n");
-                            log_message(log_file, user_id, "Another client became controller, remaining as client");
-                            return 0;
-                        }
-                    }
+                // Double check controller status while holding mutex
+                if (controllerStatus->controllerActive) {
+                    printf("Another client has already become the controller.\n");
+                    log_message(log_file, user_id, "Another client became controller while waiting for input");
+                    pthread_mutex_unlock(controllerMutex);
+                    return 0;
                 }
+
+                // Set controller status atomically
+                controllerStatus->controllerActive = 1;
+                strncpy(controllerStatus->controllerId, user_id, MAX_USER_ID_LEN - 1);
+                controllerStatus->controllerId[MAX_USER_ID_LEN - 1] = '\0';
                 
-                // No other controller found, become the new controller
+                // Become the new controller
                 is_controller = 1;
                 heartbeat_interval = new_interval;
                 log_message(log_file, user_id, "Assuming controller role with interval %d", new_interval);
+                
+                // Release mutex before sending messages
+                pthread_mutex_unlock(controllerMutex);
+                
+                // Send initial interval command
                 send_interval_command(new_interval, log_file);
                 return 1;
             }
@@ -267,6 +384,8 @@ int handle_controller_takeover(FILE *log_file) {
         printf("Invalid input. Remaining as client.\n");
         log_message(log_file, user_id, "Declined controller role");
     }
+    
+    pthread_mutex_unlock(controllerMutex);
     return 0;
 }
 
@@ -391,6 +510,15 @@ void send_controller_down(FILE *log_file) {
 // Function to handle controller shutdown
 void handle_controller_shutdown(FILE *log_file, int is_abort) {
     if (is_controller) {
+        // Release controller status atomically
+        if (pthread_mutex_lock(controllerMutex) == 0) {
+            if (strcmp(controllerStatus->controllerId, user_id) == 0) {
+                controllerStatus->controllerActive = 0;
+                memset(controllerStatus->controllerId, 0, MAX_USER_ID_LEN);
+            }
+            pthread_mutex_unlock(controllerMutex);
+        }
+
         if (is_abort) {
             // For abort, try to send CONTROLLER_DOWN quickly
             send_controller_down(log_file);
@@ -410,6 +538,7 @@ void handle_controller_shutdown(FILE *log_file, int is_abort) {
     if (sockfd >= 0) {
         close(sockfd);
     }
+    cleanup_shared_memory();
 }
 
 // Function to handle controller input
@@ -527,6 +656,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Initialize shared memory and mutex
+    if (init_shared_memory() != 0) {
+        fprintf(stderr, "Failed to initialize shared memory\n");
+        return EXIT_FAILURE;
+    }
+
     // create log file in append mode
     char log_filename[64] = "heartbeat_app_";
     strcat(log_filename, user_id);
@@ -578,26 +713,60 @@ int main(int argc, char *argv[]) {
             }
         } else {
             // Client mode
+            fd_set read_fds;
+            struct timeval tv;
+            
+            FD_ZERO(&read_fds);
+            FD_SET(sockfd, &read_fds);
+            FD_SET(STDIN_FILENO, &read_fds);  // Add stdin to check for user input
+            
+            // Set timeout for select
+            tv.tv_sec = 0;  // Don't block
+            tv.tv_usec = 100000;  // 100ms timeout
+            
+            if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) > 0) {
+                // Handle socket input
+                if (FD_ISSET(sockfd, &read_fds)) {
+                    receive_messages(sockfd, log_file);
+                }
+                
+                // Handle user input
+                if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+                    char input[MAX_MSG_LEN];
+                    if (fgets(input, sizeof(input), stdin) != NULL) {
+                        input[strcspn(input, "\n")] = 0;  // Remove newline
+                        
+                        if (strcmp(input, "exit") == 0) {
+                            log_message(log_file, user_id, "User entered exit command");
+                            // Send BYE message
+                            send_multicast_message("BYE");
+                            // Close resources
+                            fclose(log_file);
+                            close(sockfd);
+                            cleanup_shared_memory();
+                            exit(EXIT_SUCCESS);
+                        }
+                        else if (strcmp(input, "abort") == 0) {
+                            log_message(log_file, user_id, "User entered abort command");
+                            fclose(log_file);
+                            close(sockfd);
+                            cleanup_shared_memory();
+                            abort();
+                        }
+                        else {
+                            // Reject any other input
+                            printf("Invalid input. Only 'exit' and 'abort' commands are accepted.\n");
+                        }
+                    }
+                }
+            }
+            
             // Send heartbeat with random delay
             if (heartbeat_interval > 0) {
                 // Add random delay between 0 and 0.5 seconds
                 usleep((rand() % 500000) + 1);
                 send_heartbeat(log_file);
                 sleep(heartbeat_interval);
-            }
-            
-            // Check for messages
-            fd_set read_fds;
-            struct timeval tv;
-            
-            FD_ZERO(&read_fds);
-            FD_SET(sockfd, &read_fds);
-            
-            tv.tv_sec = 0;  // Don't block
-            tv.tv_usec = 100000;  // 100ms timeout
-            
-            if (select(sockfd + 1, &read_fds, NULL, NULL, &tv) > 0) {
-                receive_messages(sockfd, log_file);
             }
         }
     }
@@ -606,5 +775,6 @@ int main(int argc, char *argv[]) {
     if (is_controller) {
         handle_controller_shutdown(log_file, 0);
     }
+    cleanup_shared_memory();
     return EXIT_SUCCESS;
 }
